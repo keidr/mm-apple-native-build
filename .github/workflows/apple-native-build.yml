@@ -20,16 +20,26 @@ jobs:
       BUILD_SCRIPT_SHA256: F96AE5E129B3FEE694269979FC0ABAAD33416281E546CDB2C85055B1E9FCA20A
       CORE_METADATA_SHA256: 4CBDE3BC980A96A1CF0D53053A4FDAE19E0C080B04047256242D45515B031FFB
       GAMEKIT_METADATA_SHA256: 86F41339051B025FAAC90B2B9699081F52F8DF8BA7518B1A701C8A0E5835C171
-      SOURCE_DIR: ${{ runner.temp }}/apple-unityplugins
-      OUTPUT_DIR: ${{ runner.temp }}/native-packages
-      EVIDENCE_DIR: ${{ runner.temp }}/evidence
-      BUNDLE_PATH: ${{ runner.temp }}/C2C2_AppleNativeBuild_27.0.tar.gz
 
     steps:
       - name: Toolchain and resource preflight
         shell: bash
         run: |
           set -Eeuo pipefail
+          # runner.temp is unavailable in jobs.<job_id>.env. Initialize paths
+          # on the runner and persist them for subsequent steps using GITHUB_ENV.
+          : "${RUNNER_TEMP:?RUNNER_TEMP is required}"
+          : "${GITHUB_ENV:?GITHUB_ENV is required}"
+          export SOURCE_DIR="$RUNNER_TEMP/apple-unityplugins"
+          export OUTPUT_DIR="$RUNNER_TEMP/native-packages"
+          export EVIDENCE_DIR="$RUNNER_TEMP/evidence"
+          export BUNDLE_PATH="$RUNNER_TEMP/C2C2_AppleNativeBuild_27.0.tar.gz"
+          {
+            printf 'SOURCE_DIR=%s\n' "$SOURCE_DIR"
+            printf 'OUTPUT_DIR=%s\n' "$OUTPUT_DIR"
+            printf 'EVIDENCE_DIR=%s\n' "$EVIDENCE_DIR"
+            printf 'BUNDLE_PATH=%s\n' "$BUNDLE_PATH"
+          } >> "$GITHUB_ENV"
           mkdir -p "$EVIDENCE_DIR" "$OUTPUT_DIR"
           {
             echo "ImageOS=${ImageOS:-unknown}"
