@@ -1,0 +1,285 @@
+name: C2-C2 Apple Native Package Build
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: c2c2-apple-native-build-27-0
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Apple.Core 3.3.0 and Apple.GameKit 4.1.0
+    runs-on: xcode-27
+    timeout-minutes: 120
+    env:
+      APPLE_REPOSITORY: https://github.com/apple/unityplugins.git
+      APPLE_COMMIT: ffe61740e2fad5015948b14d41dbc0486664aed0
+      BUILD_SCRIPT_SHA256: F96AE5E129B3FEE694269979FC0ABAAD33416281E546CDB2C85055B1E9FCA20A
+      CORE_METADATA_SHA256: 4CBDE3BC980A96A1CF0D53053A4FDAE19E0C080B04047256242D45515B031FFB
+      GAMEKIT_METADATA_SHA256: 86F41339051B025FAAC90B2B9699081F52F8DF8BA7518B1A701C8A0E5835C171
+      SOURCE_DIR: ${{ runner.temp }}/apple-unityplugins
+      OUTPUT_DIR: ${{ runner.temp }}/native-packages
+      EVIDENCE_DIR: ${{ runner.temp }}/evidence
+      BUNDLE_PATH: ${{ runner.temp }}/C2C2_AppleNativeBuild_27.0.tar.gz
+
+    steps:
+      - name: Toolchain and resource preflight
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p "$EVIDENCE_DIR" "$OUTPUT_DIR"
+          {
+            echo "ImageOS=${ImageOS:-unknown}"
+            echo "ImageVersion=${ImageVersion:-unknown}"
+            uname -a
+            uname -m
+            sw_vers
+            xcode-select -p
+            xcodebuild -version
+            xcrun --sdk iphoneos --show-sdk-version
+            python3 --version
+            npm --version
+            git --version
+            tar --version
+            sysctl hw.memsize
+            df -h "$RUNNER_TEMP"
+          } | tee "$EVIDENCE_DIR/toolchain.txt"
+
+          test "$(uname -m)" = "arm64"
+          xcodebuild -version | head -n 1 | grep -Eq '^Xcode 27([.]|$)'
+          xcrun --sdk iphoneos --show-sdk-version | grep -Eq '^27([.]|$)'
+          command -v python3 npm git tar xcodebuild xcrun shasum file lipo codesign
+
+          free_kb="$(df -Pk "$RUNNER_TEMP" | awk 'NR == 2 { print $4 }')"
+          echo "free_kb=$free_kb" | tee -a "$EVIDENCE_DIR/toolchain.txt"
+          test "$free_kb" -ge 10485760
+
+      - name: Fetch exact Apple source revision
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          git init "$SOURCE_DIR"
+          git -C "$SOURCE_DIR" remote add origin "$APPLE_REPOSITORY"
+          git -C "$SOURCE_DIR" fetch --depth=1 origin "$APPLE_COMMIT"
+          git -C "$SOURCE_DIR" checkout --detach FETCH_HEAD
+          actual_commit="$(git -C "$SOURCE_DIR" rev-parse HEAD)"
+          printf '%s\n' "$actual_commit" | tee "$EVIDENCE_DIR/source-commit.txt"
+          test "$actual_commit" = "$APPLE_COMMIT"
+          git -C "$SOURCE_DIR" status --short | tee "$EVIDENCE_DIR/source-status-before.txt"
+          test ! -s "$EVIDENCE_DIR/source-status-before.txt"
+
+      - name: Verify script and package metadata
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          cd "$SOURCE_DIR"
+          actual_build_sha="$(shasum -a 256 build.py | awk '{ print toupper($1) }')"
+          actual_core_sha="$(shasum -a 256 plug-ins/Apple.Core/Apple.Core_Unity/Assets/Apple.Core/package.json | awk '{ print toupper($1) }')"
+          actual_gamekit_sha="$(shasum -a 256 plug-ins/Apple.GameKit/Apple.GameKit_Unity/Assets/Apple.GameKit/package.json | awk '{ print toupper($1) }')"
+          {
+            echo "build.py $actual_build_sha"
+            echo "Apple.Core/package.json $actual_core_sha"
+            echo "Apple.GameKit/package.json $actual_gamekit_sha"
+          } | tee "$EVIDENCE_DIR/source-hashes.txt"
+          test "$actual_build_sha" = "$BUILD_SCRIPT_SHA256"
+          test "$actual_core_sha" = "$CORE_METADATA_SHA256"
+          test "$actual_gamekit_sha" = "$GAMEKIT_METADATA_SHA256"
+
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          root = Path.cwd()
+          core = json.loads((root / "plug-ins/Apple.Core/Apple.Core_Unity/Assets/Apple.Core/package.json").read_text())
+          gamekit = json.loads((root / "plug-ins/Apple.GameKit/Apple.GameKit_Unity/Assets/Apple.GameKit/package.json").read_text())
+          assert core["name"] == "com.apple.unityplugin.core"
+          assert core["version"] == "3.3.0"
+          assert gamekit["name"] == "com.apple.unityplugin.gamekit"
+          assert gamekit["version"] == "4.1.0"
+          assert gamekit["dependencies"] == {"com.apple.unityplugin.core": "3.3.0"}
+          PY
+
+      - name: Build and pack Core and GameKit
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          cd "$SOURCE_DIR"
+          printf '%q ' python3 build.py -p Core GameKit -m iOS macOS -b build pack -bc all -o "$OUTPUT_DIR" -nc \
+            | tee "$EVIDENCE_DIR/build-command.txt"
+          printf '\n' | tee -a "$EVIDENCE_DIR/build-command.txt"
+          python3 build.py \
+            -p Core GameKit \
+            -m iOS macOS \
+            -b build pack \
+            -bc all \
+            -o "$OUTPUT_DIR" \
+            -nc \
+            </dev/null 2>&1 | tee "$EVIDENCE_DIR/build.log"
+
+      - name: Validate native products and package archives
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          core="$OUTPUT_DIR/com.apple.unityplugin.core-3.3.0.tgz"
+          gamekit="$OUTPUT_DIR/com.apple.unityplugin.gamekit-4.1.0.tgz"
+          test -s "$core"
+          test -s "$gamekit"
+          test "$(find "$OUTPUT_DIR" -maxdepth 1 -type f -name '*.tgz' | wc -l | tr -d ' ')" = "2"
+
+          tar -tzf "$core" > "$EVIDENCE_DIR/core-archive-entries.txt"
+          tar -tzf "$gamekit" > "$EVIDENCE_DIR/gamekit-archive-entries.txt"
+
+          for listing in "$EVIDENCE_DIR/core-archive-entries.txt" "$EVIDENCE_DIR/gamekit-archive-entries.txt"; do
+            grep -Fq 'package/package.json' "$listing"
+            grep -Fq 'package/LICENSE.txt' "$listing"
+            grep -Fq 'NativeLibraries~/Debug/iOS/' "$listing"
+            grep -Fq 'NativeLibraries~/Release/iOS/' "$listing"
+            grep -Fq 'NativeLibraries~/Debug/macOS/' "$listing"
+            grep -Fq 'NativeLibraries~/Release/macOS/' "$listing"
+          done
+
+          # Review every tar member before artifacts are transferred or extracted.
+          # Require correct metadata, safe paths, and populated native paths.
+          python3 - "$core" "$gamekit" <<'PY'
+          import json
+          import posixpath
+          import sys
+          import tarfile
+
+          def metadata(path):
+              with tarfile.open(path, "r:gz") as archive:
+                  names = set()
+                  for member in archive.getmembers():
+                      name = member.name
+                      parts = name.split("/")
+                      assert name == "package" or (
+                          name.startswith("package/") and
+                          ".." not in parts and
+                          "." not in parts and
+                          "" not in parts[:-1]
+                      ), f"Unsafe archive path: {name}"
+                      assert not name.startswith("/"), f"Absolute archive path: {name}"
+                      if member.issym() or member.islnk():
+                          target = (
+                              posixpath.join(posixpath.dirname(name), member.linkname)
+                              if member.issym() else member.linkname
+                          )
+                          normalized = posixpath.normpath(target)
+                          assert normalized.startswith("package/"), (
+                              f"Escaping archive link: {name} -> {member.linkname}"
+                          )
+                      names.add(name)
+                  assert "package/package.json" in names
+                  assert "package/LICENSE.txt" in names
+                  for config in ("Debug", "Release"):
+                      for platform in ("iOS", "macOS"):
+                          prefix = f"package/NativeLibraries~/{config}/{platform}/"
+                          assert any(n.startswith(prefix) and n != prefix
+                                     for n in names), f"Missing native contents: {prefix}"
+                  payload = archive.extractfile("package/package.json")
+                  assert payload is not None
+                  return json.load(payload)
+
+          core = metadata(sys.argv[1])
+          gamekit = metadata(sys.argv[2])
+          assert (core["name"], core["version"]) == ("com.apple.unityplugin.core", "3.3.0")
+          assert (gamekit["name"], gamekit["version"]) == ("com.apple.unityplugin.gamekit", "4.1.0")
+          assert gamekit["dependencies"] == {"com.apple.unityplugin.core": "3.3.0"}
+          PY
+
+          # Verify iOS/macOS arm64 separately for Core and GameKit,
+          # for each requested build configuration. Do not accept one arm64
+          # binary somewhere in the workspace as proof for all artifacts.
+          python3 - <<'PY'
+          import os
+          import pathlib
+          import subprocess
+
+          root = pathlib.Path(os.environ["SOURCE_DIR"]) / "plug-ins"
+          evidence = pathlib.Path(os.environ["EVIDENCE_DIR"])
+          rows = []
+          for plugin in ("Apple.Core", "Apple.GameKit"):
+              for config in ("Debug", "Release"):
+                  for platform in ("iOS", "macOS"):
+                      folder = root / plugin / (plugin + "_Unity") / "Assets" / plugin / "NativeLibraries~" / config / platform
+                      assert folder.is_dir(), f"Missing native directory: {folder}"
+                      found_arm64 = False
+                      for path in folder.rglob("*"):
+                          if not path.is_file():
+                              continue
+                          result = subprocess.run(["lipo", "-archs", str(path)],
+                                                  text=True, capture_output=True)
+                          if result.returncode == 0 and "arm64" in result.stdout.split():
+                              rows.append(f"{plugin}|{config}|{platform}|arm64|{path}")
+                              found_arm64 = True
+                      assert found_arm64, f"Missing {plugin} {config} {platform} arm64 native product"
+          (evidence / "native-architectures-verified.txt").write_text("\n".join(rows) + "\n")
+          PY
+
+          find "$SOURCE_DIR/plug-ins/Apple.Core" "$SOURCE_DIR/plug-ins/Apple.GameKit" \
+            -type f -path '*/NativeLibraries~/*' -print | LC_ALL=C sort \
+            > "$EVIDENCE_DIR/native-files.txt"
+          test -s "$EVIDENCE_DIR/native-files.txt"
+
+          : > "$EVIDENCE_DIR/native-inventory.txt"
+          : > "$EVIDENCE_DIR/native-architectures.txt"
+          : > "$EVIDENCE_DIR/codesign-status.txt"
+          while IFS= read -r native_file; do
+            shasum -a 256 "$native_file" >> "$EVIDENCE_DIR/native-inventory.txt"
+            file "$native_file" >> "$EVIDENCE_DIR/native-inventory.txt"
+            lipo -info "$native_file" >> "$EVIDENCE_DIR/native-architectures.txt" 2>&1 || true
+            codesign -dv --verbose=4 "$native_file" >> "$EVIDENCE_DIR/codesign-status.txt" 2>&1 || true
+          done < "$EVIDENCE_DIR/native-files.txt"
+
+          shasum -a 256 "$core" "$gamekit" | tee "$EVIDENCE_DIR/package-sha256.txt"
+          stat -f '%z %N' "$core" "$gamekit" | tee "$EVIDENCE_DIR/package-sizes.txt"
+          git -C "$SOURCE_DIR" status --short | tee "$EVIDENCE_DIR/source-status-after.txt"
+          df -h "$RUNNER_TEMP" | tee "$EVIDENCE_DIR/disk-after.txt"
+
+      - name: Create bounded transfer bundle
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          tar -czf "$BUNDLE_PATH" -C "$RUNNER_TEMP" native-packages evidence
+          bundle_bytes="$(stat -f '%z' "$BUNDLE_PATH")"
+          test "$bundle_bytes" -le 471859200
+          # The hash of a completed tarball cannot be stored inside that same tarball.
+          # Publish a sibling checksum beside the transfer bundle in the same GitHub artifact.
+          bundle_hash="$(shasum -a 256 "$BUNDLE_PATH" | awk '{ print toupper($1) }')"
+          printf '%s  %s\n' "$bundle_hash" "$(basename "$BUNDLE_PATH")" \
+            > "$RUNNER_TEMP/C2C2_AppleNativeBuild_27.0.tar.gz.sha256"
+          printf '%s bytes\n' "$bundle_bytes" > "$EVIDENCE_DIR/transfer-bundle-size-LOCAL-ONLY.txt"
+
+      - name: Upload accepted build bundle
+        if: success()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: C2C2-AppleNativeBuild-27.0-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/C2C2_AppleNativeBuild_27.0.tar.gz
+            ${{ runner.temp }}/C2C2_AppleNativeBuild_27.0.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+      - name: Package failure evidence
+        if: failure()
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p "$EVIDENCE_DIR"
+          df -h "$RUNNER_TEMP" > "$EVIDENCE_DIR/disk-on-failure.txt" || true
+          tar -czf "$RUNNER_TEMP/C2C2_AppleNativeBuild_FAILURE_EVIDENCE.tar.gz" -C "$RUNNER_TEMP" evidence
+
+      - name: Upload failure evidence
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: C2C2-AppleNativeBuild-FAILURE-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/C2C2_AppleNativeBuild_FAILURE_EVIDENCE.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
